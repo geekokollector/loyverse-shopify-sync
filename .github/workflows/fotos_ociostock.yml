@@ -1,0 +1,33 @@
+name: Fotos desde OcioStock
+
+on:
+  workflow_dispatch:
+    inputs:
+      aplicar:
+        description: "¿Aplicar los cambios? (false = solo prueba)"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  fotos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Subir imágenes y descripciones
+        env:
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          DRY_RUN: ${{ github.event.inputs.aplicar == 'true' && 'false' || 'true' }}
+        run: python fotos_ociostock.py
