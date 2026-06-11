@@ -142,6 +142,14 @@ def google_image(query):
             _google_disabled[0] = True
             return None
         if r.status_code != 200:
+            detail = ""
+            try:
+                detail = r.json().get("error", {}).get("message", "")[:120]
+            except Exception:
+                pass
+            print(f"  ⚠ Google respondió HTTP {r.status_code}: {detail}")
+            if r.status_code in (400, 403):
+                _google_disabled[0] = True  # clave/CSE mal configurados: no insistir
             return None
         for it in r.json().get("items", []):
             link = it.get("link", "")
@@ -225,6 +233,8 @@ def backfill_images(budget_guard):
             img = lookup_image_by_ean(barcode, p.get("title", ""))
             if img and attach_image(p["id"], img, p.get("title", "")):
                 added += 1
+            elif not img:
+                print(f"  ✗ Sin imagen en ninguna fuente: {p.get('title','')[:50]}")
         if _image_lookups_left[0] <= 0:
             break
         link = r.headers.get("Link", "")
