@@ -44,15 +44,23 @@ sh_headers = {
 
 
 def lv_get(path, params=None):
-    """GET a Loyverse con reintentos básicos."""
-    for attempt in range(3):
+    """GET a Loyverse con reintentos y diagnóstico de errores."""
+    last_detail = ""
+    for attempt in range(4):
         r = requests.get(f"{LV_BASE}{path}", headers=lv_headers, params=params or {})
-        if r.status_code == 429:
+        if r.status_code in (429, 500, 502, 503, 504):
             time.sleep(2 * (attempt + 1))
+            last_detail = f"HTTP {r.status_code}"
             continue
         r.raise_for_status()
-        return r.json()
-    raise RuntimeError(f"Loyverse rate limit persistente en {path}")
+        try:
+            return r.json()
+        except ValueError:
+            last_detail = (f"HTTP {r.status_code}, respuesta no-JSON: "
+                           f"{r.text[:200]!r}")
+            time.sleep(2 * (attempt + 1))
+            continue
+    raise RuntimeError(f"Loyverse fallo persistente en {path}: {last_detail}")
 
 
 def sh_request(method, path, json=None, params=None):
@@ -319,9 +327,20 @@ def main():
             drafts += 1
         print(f"→ Borradores creados: {drafts}")
     elif not_found:
-        print("\n→ Productos en Loyverse sin coincidencia en Shopify (no se crean borradores):")
-        for item in not_found[:30]:
-            print(f"    · {item['item_name']} [barcode: {item['barcode'] or '-'} | sku: {item['sku'] or '-'}]")
+        import csv
+        with open("no_encontrados.csv", "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f, delimiter=";")
+            w.writerow(["Producto", "Codigo de barras", "SKU", "Precio", "Stock Geeko"])
+            for item in not_found:
+                w.writerow([
+                    item["item_name"] + (f" - {item['variant_name']}" if item["variant_name"] else ""),
+                    item["barcode"],
+                    item["sku"],
+                    item["price"],
+                    lv_stock.get(item["variant_id"], 0),
+                ])
+        print(f"\n→ Lista completa de {len(not_found)} productos sin coincidencia "
+              f"guardada en no_encontrados.csv")
 
     print("\n✔ Sincronización completada")
 
