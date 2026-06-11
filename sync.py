@@ -34,6 +34,8 @@ SAFETY_BUFFER = int(os.environ.get("SAFETY_BUFFER", "0"))
 CREATE_DRAFTS = os.environ.get("CREATE_DRAFTS", "true").lower() == "true"
 FETCH_IMAGES = os.environ.get("FETCH_IMAGES", "true").lower() == "true"
 IMAGE_BUDGET = int(os.environ.get("IMAGE_BUDGET", "8"))  # consultas máx. por pasada
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
+GOOGLE_CSE_ID = os.environ.get("GOOGLE_CSE_ID", "")
 
 LV_BASE = "https://api.loyverse.com/v1.0"
 SH_BASE = f"https://{SHOPIFY_STORE}/admin/api/2024-10"
@@ -120,33 +122,68 @@ def set_inventory(location_id, inventory_item_id, qty, label=""):
 
 
 _image_lookups_left = [IMAGE_BUDGET]
+_google_disabled = [False]
 
 
-def lookup_image_by_ean(barcode):
-    """Busca una imagen del producto por su EAN en UPCitemdb (API gratuita,
-    ~100 consultas/día). Devuelve URL de imagen o None. Respeta el presupuesto
-    por pasada y se desactiva si la API devuelve límite excedido."""
-    if not FETCH_IMAGES or _image_lookups_left[0] <= 0 or not barcode:
+def google_image(query):
+    """Busca una imagen en Google (Custom Search API). Devuelve URL o None."""
+    if not GOOGLE_API_KEY or not GOOGLE_CSE_ID or _google_disabled[0]:
         return None
-    _image_lookups_left[0] -= 1
     try:
         r = requests.get(
-            "https://api.upcitemdb.com/prod/trial/lookup",
-            params={"upc": barcode}, timeout=15,
+            "https://www.googleapis.com/customsearch/v1",
+            params={
+                "key": GOOGLE_API_KEY, "cx": GOOGLE_CSE_ID,
+                "q": query, "searchType": "image", "num": 5, "safe": "active",
+            }, timeout=15,
         )
         if r.status_code == 429:
-            print("  ⚠ Límite diario de búsqueda de imágenes alcanzado (seguirá mañana)")
-            _image_lookups_left[0] = 0
+            print("  ⚠ Límite diario de Google alcanzado (seguirá mañana)")
+            _google_disabled[0] = True
             return None
         if r.status_code != 200:
             return None
-        items = r.json().get("items", [])
-        for it in items:
-            for img in it.get("images", []):
-                if img.startswith("http"):
-                    return img
+        for it in r.json().get("items", []):
+            link = it.get("link", "")
+            img = it.get("image", {})
+            # descartamos miniaturas demasiado pequeñas
+            if link.startswith("http") and img.get("width", 0) >= 300:
+                return link
     except Exception:
         return None
+    return None
+
+
+def lookup_image_by_ean(barcode, name=""):
+    """Busca una imagen del producto: 1º UPCitemdb por EAN, 2º Google por EAN,
+    3º Google por nombre. Devuelve URL de imagen o None."""
+    if not FETCH_IMAGES or _image_lookups_left[0] <= 0:
+        return None
+    _image_lookups_left[0] -= 1
+    # Fuente 1: UPCitemdb (gratuita, por EAN)
+    if barcode:
+        try:
+            r = requests.get(
+                "https://api.upcitemdb.com/prod/trial/lookup",
+                params={"upc": barcode}, timeout=15,
+            )
+            if r.status_code == 200:
+                for it in r.json().get("items", []):
+                    for img in it.get("images", []):
+                        if img.startswith("http"):
+                            return img
+        except Exception:
+            pass
+    # Fuente 2: Google por EAN
+    if barcode:
+        img = google_image(barcode)
+        if img:
+            return img
+    # Fuente 3: Google por nombre
+    if name:
+        img = google_image(name)
+        if img:
+            return img
     return None
 
 
@@ -185,7 +222,7 @@ def backfill_images(budget_guard):
                     break
             if not barcode:
                 continue
-            img = lookup_image_by_ean(barcode)
+            img = lookup_image_by_ean(barcode, p.get("title", ""))
             if img and attach_image(p["id"], img, p.get("title", "")):
                 added += 1
         if _image_lookups_left[0] <= 0:
@@ -431,7 +468,7 @@ def main():
             inv_item = new_product["variants"][0]["inventory_item_id"]
             target_qty = max(0, lv_qty - SAFETY_BUFFER)
             set_inventory(location_id, inv_item, target_qty, title)
-            img = lookup_image_by_ean(item["barcode"])
+            img = lookup_image_by_ean(item["barcode"], title)
             if img:
                 attach_image(new_product["id"], img, title)
             print(f"  ＋ Borrador: {title[:50]} (stock {target_qty})")
