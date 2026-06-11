@@ -32,6 +32,8 @@ LOYVERSE_CATEGORIES = [
 ]
 SAFETY_BUFFER = int(os.environ.get("SAFETY_BUFFER", "0"))
 CREATE_DRAFTS = os.environ.get("CREATE_DRAFTS", "true").lower() == "true"
+FETCH_IMAGES = os.environ.get("FETCH_IMAGES", "true").lower() == "true"
+IMAGE_BUDGET = int(os.environ.get("IMAGE_BUDGET", "8"))  # consultas máx. por pasada
 
 LV_BASE = "https://api.loyverse.com/v1.0"
 SH_BASE = f"https://{SHOPIFY_STORE}/admin/api/2024-10"
@@ -117,6 +119,90 @@ def set_inventory(location_id, inventory_item_id, qty, label=""):
         return False
 
 
+_image_lookups_left = [IMAGE_BUDGET]
+
+
+def lookup_image_by_ean(barcode):
+    """Busca una imagen del producto por su EAN en UPCitemdb (API gratuita,
+    ~100 consultas/día). Devuelve URL de imagen o None. Respeta el presupuesto
+    por pasada y se desactiva si la API devuelve límite excedido."""
+    if not FETCH_IMAGES or _image_lookups_left[0] <= 0 or not barcode:
+        return None
+    _image_lookups_left[0] -= 1
+    try:
+        r = requests.get(
+            "https://api.upcitemdb.com/prod/trial/lookup",
+            params={"upc": barcode}, timeout=15,
+        )
+        if r.status_code == 429:
+            print("  ⚠ Límite diario de búsqueda de imágenes alcanzado (seguirá mañana)")
+            _image_lookups_left[0] = 0
+            return None
+        if r.status_code != 200:
+            return None
+        items = r.json().get("items", [])
+        for it in items:
+            for img in it.get("images", []):
+                if img.startswith("http"):
+                    return img
+    except Exception:
+        return None
+    return None
+
+
+def attach_image(product_id, image_url, label=""):
+    """Añade una imagen a un producto de Shopify desde una URL."""
+    try:
+        sh_request("POST", f"/products/{product_id}/images.json", json={
+            "image": {"src": image_url}
+        })
+        print(f"  🖼 Imagen añadida: {label[:50]}")
+        return True
+    except requests.HTTPError:
+        return False
+
+
+def backfill_images(budget_guard):
+    """Recorre los borradores sin imagen y les busca foto por EAN,
+    respetando el presupuesto de consultas por pasada."""
+    if not FETCH_IMAGES or _image_lookups_left[0] <= 0:
+        return
+    print("\n→ Buscando imágenes para borradores sin foto...")
+    params = {"limit": 250, "status": "draft", "fields": "id,title,images,variants"}
+    url = "/products.json"
+    added = 0
+    while True:
+        r = sh_request("GET", url, params=params)
+        for p in r.json().get("products", []):
+            if _image_lookups_left[0] <= 0:
+                break
+            if p.get("images"):
+                continue
+            barcode = ""
+            for v in p.get("variants", []):
+                if v.get("barcode"):
+                    barcode = v["barcode"].strip()
+                    break
+            if not barcode:
+                continue
+            img = lookup_image_by_ean(barcode)
+            if img and attach_image(p["id"], img, p.get("title", "")):
+                added += 1
+        if _image_lookups_left[0] <= 0:
+            break
+        link = r.headers.get("Link", "")
+        next_url = None
+        for part in link.split(","):
+            if 'rel="next"' in part:
+                raw = part.split(";")[0].strip().strip("<>")
+                next_url = raw.split("/admin/api/2024-10")[1]
+        if not next_url:
+            break
+        url = next_url
+        params = None
+    print(f"→ Imágenes añadidas en esta pasada: {added}")
+
+
 # ---------------------------------------------------------------------------
 # 1. LOYVERSE: artículos + stock
 # ---------------------------------------------------------------------------
@@ -161,6 +247,7 @@ def get_loyverse_items():
             if category_ids is not None and item.get("category_id") not in category_ids:
                 continue  # no es de las categorías Geeko → se ignora
             for v in item.get("variants", []):
+                store_cfg = None
                 if LOYVERSE_STORE_ID:
                     store_cfg = next(
                         (s for s in v.get("stores", [])
@@ -169,6 +256,13 @@ def get_loyverse_items():
                     )
                     if not store_cfg or not store_cfg.get("available_for_sale", False):
                         continue  # no está activo en la tienda Geeko → se ignora
+                # Precio: prioridad al precio específico de la tienda Geeko,
+                # respaldo el precio por defecto del artículo
+                price = None
+                if store_cfg and store_cfg.get("price") is not None:
+                    price = store_cfg["price"]
+                elif v.get("default_price") is not None:
+                    price = v["default_price"]
                 items.append({
                     "variant_id": v["variant_id"],
                     "item_name": item.get("item_name", ""),
@@ -177,7 +271,7 @@ def get_loyverse_items():
                     ),
                     "barcode": (v.get("barcode") or "").strip(),
                     "sku": (v.get("sku") or "").strip(),
-                    "price": v.get("default_price"),
+                    "price": price,
                 })
         cursor = data.get("cursor")
         if not cursor:
@@ -232,6 +326,8 @@ def get_shopify_variants():
                     "product_id": p["id"],
                     "qty": v.get("inventory_quantity", 0),
                     "title": p.get("title", ""),
+                    "status": p.get("status", ""),
+                    "price": v.get("price", ""),
                 }
                 bc = (v.get("barcode") or "").strip()
                 sku = (v.get("sku") or "").strip()
@@ -281,6 +377,18 @@ def main():
             match = by_sku[item["sku"]]
 
         if match:
+            # Precio: solo se sincroniza en BORRADORES (los publicados no se tocan)
+            if (match["status"] == "draft" and item["price"] is not None):
+                try:
+                    if float(match["price"] or 0) != float(item["price"]):
+                        sh_request("PUT", f"/variants/{match['variant_id']}.json", json={
+                            "variant": {"id": match["variant_id"],
+                                        "price": str(item["price"])}
+                        })
+                        print(f"  € {item['item_name'][:40]:40} "
+                              f"{match['price']} → {item['price']}")
+                except (ValueError, requests.HTTPError):
+                    pass
             if match["qty"] != target_qty:
                 ok = set_inventory(location_id, match["inventory_item_id"],
                                    target_qty, item["item_name"])
@@ -323,6 +431,9 @@ def main():
             inv_item = new_product["variants"][0]["inventory_item_id"]
             target_qty = max(0, lv_qty - SAFETY_BUFFER)
             set_inventory(location_id, inv_item, target_qty, title)
+            img = lookup_image_by_ean(item["barcode"])
+            if img:
+                attach_image(new_product["id"], img, title)
             print(f"  ＋ Borrador: {title[:50]} (stock {target_qty})")
             drafts += 1
         print(f"→ Borradores creados: {drafts}")
@@ -341,6 +452,8 @@ def main():
                 ])
         print(f"\n→ Lista completa de {len(not_found)} productos sin coincidencia "
               f"guardada en no_encontrados.csv")
+
+    backfill_images(_image_lookups_left)
 
     print("\n✔ Sincronización completada")
 
