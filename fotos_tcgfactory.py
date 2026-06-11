@@ -1,26 +1,20 @@
 """
-Extractor de imágenes desde tcgfactory.com para Geeko Kollector
-----------------------------------------------------------------
-Recorre los productos de Shopify SIN ninguna imagen, busca su EAN en el
-buscador público de TCG Factory y, si encuentra la ficha del producto,
-copia la imagen principal al producto de Shopify (Shopify la descarga
-y la aloja en su propio CDN de forma permanente).
-
-Seguridad y cortesía:
-- Verifica que el EAN aparece en la ficha antes de dar la coincidencia por buena
-- Pausa de 2 segundos entre peticiones a TCG Factory
-- Límite de productos procesados por pasada (MAX_LOOKUPS)
-- Modo prueba (DRY_RUN=true): solo informa, no sube nada
+Extractor de imágenes desde tcgfactory.com para Geeko Kollector (v2)
+---------------------------------------------------------------------
+Estrategia: busca por NOMBRE en el buscador público de TCG Factory
+(su buscador no indexa EANs) y valida la coincidencia comparando títulos.
+Solo procesa productos de Shopify SIN ninguna imagen.
 
 Variables de entorno:
-  SHOPIFY_TOKEN, SHOPIFY_STORE   (las de siempre)
+  SHOPIFY_TOKEN, SHOPIFY_STORE
   DRY_RUN      "true" (default) = solo mirar | "false" = subir imágenes
-  MAX_LOOKUPS  máximo de productos a procesar por pasada (default 40)
+  MAX_LOOKUPS  máximo de productos por pasada (default 40)
 """
 
 import os
 import re
 import time
+import unicodedata
 import requests
 
 SHOPIFY_TOKEN = os.environ["SHOPIFY_TOKEN"]
@@ -31,12 +25,12 @@ MAX_LOOKUPS = int(os.environ.get("MAX_LOOKUPS", "40"))
 SH_BASE = f"https://{SHOPIFY_STORE}/admin/api/2024-10"
 sh_headers = {"X-Shopify-Access-Token": SHOPIFY_TOKEN, "Content-Type": "application/json"}
 
-TCG_SEARCH = "https://tcgfactory.com/es/buscar?controller=search&s={ean}"
-UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) GeekoKollector-ImageBot/1.0"}
+UA = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/126.0 Safari/537.36"}
 
 
 def sh_request(method, path, json=None, params=None):
-    for attempt in range(5):
+    for _ in range(5):
         r = requests.request(method, f"{SH_BASE}{path}", headers=sh_headers,
                              json=json, params=params or {})
         if r.status_code == 429:
@@ -48,65 +42,82 @@ def sh_request(method, path, json=None, params=None):
     raise RuntimeError(f"Shopify rate limit persistente en {path}")
 
 
-def tcg_get(url):
+def normalize(text):
+    """minúsculas, sin acentos ni símbolos, para comparar títulos"""
+    text = unicodedata.normalize("NFKD", text)
+    text = "".join(c for c in text if not unicodedata.combining(c))
+    text = re.sub(r"[^a-z0-9 ]", " ", text.lower())
+    return [w for w in text.split() if len(w) > 1]
+
+
+def title_match(words_a, words_b):
+    """proporción de palabras del título A presentes en el B"""
+    if not words_a:
+        return 0.0
+    setb = set(words_b)
+    return sum(1 for w in words_a if w in setb) / len(words_a)
+
+
+def tcg_get(url, params=None):
     time.sleep(2)  # cortesía con su servidor
-    r = requests.get(url, headers=UA, timeout=20)
+    try:
+        r = requests.get(url, headers=UA, params=params, timeout=20)
+    except requests.RequestException as e:
+        print(f"    [red] {e}")
+        return None
     if r.status_code != 200:
+        print(f"    [HTTP {r.status_code}]")
         return None
     return r.text
 
 
-def find_product_url(ean):
-    """Busca el EAN en TCG Factory y devuelve la URL de la primera ficha."""
-    html = tcg_get(TCG_SEARCH.format(ean=ean))
+def search_tcg(name):
+    """Busca por nombre y devuelve lista de (url_ficha, titulo)."""
+    html = tcg_get("https://tcgfactory.com/es/buscar",
+                   params={"controller": "search", "s": name})
     if not html:
-        return None
-    # Enlaces de fichas de producto en los resultados (PrestaShop)
-    links = re.findall(r'href="(https://tcgfactory\.com/es/[^"]+?\.html)"', html)
-    if not links:
-        links = re.findall(
-            r'<h\d[^>]*class="[^"]*product[^"]*"[^>]*>\s*<a\s+href="([^"]+)"', html)
-    return links[0] if links else None
+        return []
+    results = []
+    # PrestaShop: fichas con enlaces .html; capturamos enlace + texto cercano
+    for m in re.finditer(
+            r'<a[^>]+href="(https://tcgfactory\.com/es/[^"]+?\.html)"[^>]*>([^<]{5,120})</a>',
+            html):
+        url, text = m.group(1), m.group(2).strip()
+        if text and (url, text) not in results:
+            results.append((url, text))
+    return results[:5]
 
 
-def extract_image(product_url, ean):
-    """Abre la ficha, verifica que contiene el EAN y devuelve la imagen principal."""
+def extract_image(product_url):
     html = tcg_get(product_url)
     if not html:
-        return None
-    if ean not in html:
-        return None  # la ficha no menciona ese EAN → coincidencia dudosa, se descarta
-    m = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html)
-    if not m:
-        m = re.search(r'"large_default"[^}]*?"url":"([^"]+)"', html)
-        if m:
-            return m.group(1).replace("\\/", "/")
-        return None
-    return m.group(1)
+        return None, None
+    title = ""
+    mt = re.search(r'<meta\s+property="og:title"\s+content="([^"]+)"', html)
+    if mt:
+        title = mt.group(1)
+    mi = re.search(r'<meta\s+property="og:image"\s+content="([^"]+)"', html)
+    if mi:
+        return mi.group(1), title
+    mi = re.search(r'(https://tcgfactory\.com/\d+-(?:home|large)_default/[^"\s]+\.jpg)', html)
+    if mi:
+        return mi.group(1), title
+    return None, title
 
 
 def main():
     print(f"Modo: {'PRUEBA (no sube nada)' if DRY_RUN else 'SUBIDA ACTIVA'} | "
           f"Límite por pasada: {MAX_LOOKUPS}\n")
 
-    # 1. Productos de Shopify sin ninguna imagen
     print("→ Buscando productos sin imagen en Shopify...")
     candidates = []
-    params = {"limit": 250, "fields": "id,title,images,variants"}
+    params = {"limit": 250, "fields": "id,title,images"}
     url = "/products.json"
     while True:
         r = sh_request("GET", url, params=params)
         for p in r.json().get("products", []):
-            if p.get("images"):
-                continue
-            barcode = ""
-            for v in p.get("variants", []):
-                if v.get("barcode"):
-                    barcode = v["barcode"].strip()
-                    break
-            if barcode:
-                candidates.append({"id": p["id"], "title": p.get("title", ""),
-                                   "barcode": barcode})
+            if not p.get("images"):
+                candidates.append({"id": p["id"], "title": p.get("title", "")})
         link = r.headers.get("Link", "")
         nxt = None
         for part in link.split(","):
@@ -115,25 +126,36 @@ def main():
         if not nxt:
             break
         url, params = nxt, None
+    print(f"  {len(candidates)} productos sin imagen\n")
 
-    print(f"  {len(candidates)} productos sin imagen (con EAN)\n")
-
-    # 2. Buscar en TCG Factory
     found, uploaded, misses = 0, 0, 0
     for c in candidates[:MAX_LOOKUPS]:
-        purl = find_product_url(c["barcode"])
-        if not purl:
+        my_words = normalize(c["title"])
+        query = " ".join(my_words[:7])  # primeras palabras significativas
+        results = search_tcg(query)
+        best = None
+        for purl, text in results:
+            score = title_match(my_words, normalize(text))
+            if score >= 0.6 and (best is None or score > best[0]):
+                best = (score, purl)
+        if not best:
             misses += 1
-            print(f"  ✗ {c['title'][:55]:55} [no encontrado]")
+            print(f"  ✗ {c['title'][:55]:55} [sin resultados fiables "
+                  f"({len(results)} candidatos)]")
             continue
-        img = extract_image(purl, c["barcode"])
+        img, page_title = extract_image(best[1])
         if not img:
             misses += 1
-            print(f"  ✗ {c['title'][:55]:55} [ficha sin EAN verificable o sin imagen]")
+            print(f"  ✗ {c['title'][:55]:55} [ficha sin imagen]")
+            continue
+        # verificación final contra el título de la ficha
+        if page_title and title_match(my_words, normalize(page_title)) < 0.5:
+            misses += 1
+            print(f"  ✗ {c['title'][:55]:55} [ficha no coincide: {page_title[:40]}]")
             continue
         found += 1
         if DRY_RUN:
-            print(f"  ✓ {c['title'][:55]:55} → {img[:60]}...")
+            print(f"  ✓ {c['title'][:55]:55} → {img[:60]}")
         else:
             try:
                 sh_request("POST", f"/products/{c['id']}/images.json",
@@ -144,12 +166,12 @@ def main():
                 print(f"  ⚠ {c['title'][:55]:55} [error al subir: {e}]")
 
     print(f"\n→ Procesados: {min(len(candidates), MAX_LOOKUPS)} | "
-          f"Encontrados en TCG Factory: {found} | "
+          f"Encontrados: {found} | "
           f"{'Subidos: ' + str(uploaded) if not DRY_RUN else 'Modo prueba, nada subido'} | "
           f"Sin coincidencia: {misses}")
-    remaining = len(candidates) - MAX_LOOKUPS
-    if remaining > 0:
-        print(f"→ Quedan {remaining} productos para próximas pasadas")
+    rem = len(candidates) - MAX_LOOKUPS
+    if rem > 0:
+        print(f"→ Quedan {rem} productos para próximas pasadas")
     print("\n✔ Terminado")
 
 
