@@ -26,5 +26,5 @@ jobs:
           LOYVERSE_STORE_ID: ${{ secrets.LOYVERSE_STORE_ID }}
           LOYVERSE_CATEGORIES: "geeko"
           SAFETY_BUFFER: "0"
-          CREATE_DRAFTS: "false"
+          CREATE_DRAFTS: "true"
         run: python sync.py
