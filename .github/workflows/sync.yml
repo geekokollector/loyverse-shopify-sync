@@ -24,6 +24,7 @@ jobs:
           SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
           SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
           LOYVERSE_STORE_ID: ${{ secrets.LOYVERSE_STORE_ID }}
+          LOYVERSE_CATEGORIES: "geeko"
           SAFETY_BUFFER: "0"
           CREATE_DRAFTS: "false"
         run: python sync.py
