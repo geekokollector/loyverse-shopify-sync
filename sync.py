@@ -66,6 +66,44 @@ def sh_request(method, path, json=None, params=None):
     raise RuntimeError(f"Shopify rate limit persistente en {path}")
 
 
+def set_inventory(location_id, inventory_item_id, qty, label=""):
+    """Fija el stock de forma robusta:
+    - Si Shopify devuelve 422 (variante sin seguimiento o no conectada a la
+      ubicación), activa el seguimiento, conecta la ubicación y reintenta.
+    - Si aun así falla, lo registra y continúa sin parar el sync."""
+    payload = {
+        "location_id": location_id,
+        "inventory_item_id": inventory_item_id,
+        "available": qty,
+    }
+    try:
+        sh_request("POST", "/inventory_levels/set.json", json=payload)
+        return True
+    except requests.HTTPError as e:
+        if e.response is not None and e.response.status_code == 422:
+            try:
+                # 1) activar seguimiento de inventario
+                sh_request("PUT", f"/inventory_items/{inventory_item_id}.json", json={
+                    "inventory_item": {"id": inventory_item_id, "tracked": True}
+                })
+                # 2) conectar el artículo a la ubicación
+                try:
+                    sh_request("POST", "/inventory_levels/connect.json", json={
+                        "location_id": location_id,
+                        "inventory_item_id": inventory_item_id,
+                    })
+                except requests.HTTPError:
+                    pass  # ya estaba conectado
+                # 3) reintentar
+                sh_request("POST", "/inventory_levels/set.json", json=payload)
+                return True
+            except requests.HTTPError as e2:
+                print(f"  ⚠ No se pudo fijar stock de '{label}': {e2}")
+                return False
+        print(f"  ⚠ Error al fijar stock de '{label}': {e}")
+        return False
+
+
 # ---------------------------------------------------------------------------
 # 1. LOYVERSE: artículos + stock
 # ---------------------------------------------------------------------------
@@ -194,13 +232,11 @@ def main():
 
         if match:
             if match["qty"] != target_qty:
-                sh_request("POST", "/inventory_levels/set.json", json={
-                    "location_id": location_id,
-                    "inventory_item_id": match["inventory_item_id"],
-                    "available": target_qty,
-                })
-                print(f"  ✓ {item['item_name'][:40]:40} {match['qty']} → {target_qty}")
-                updated += 1
+                ok = set_inventory(location_id, match["inventory_item_id"],
+                                   target_qty, item["item_name"])
+                if ok:
+                    print(f"  ✓ {item['item_name'][:40]:40} {match['qty']} → {target_qty}")
+                    updated += 1
             else:
                 skipped += 1
         else:
@@ -236,11 +272,7 @@ def main():
             new_product = r.json()["product"]
             inv_item = new_product["variants"][0]["inventory_item_id"]
             target_qty = max(0, lv_qty - SAFETY_BUFFER)
-            sh_request("POST", "/inventory_levels/set.json", json={
-                "location_id": location_id,
-                "inventory_item_id": inv_item,
-                "available": target_qty,
-            })
+            set_inventory(location_id, inv_item, target_qty, title)
             print(f"  ＋ Borrador: {title[:50]} (stock {target_qty})")
             drafts += 1
         print(f"→ Borradores creados: {drafts}")
