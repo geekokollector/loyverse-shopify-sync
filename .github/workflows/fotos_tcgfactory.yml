@@ -1,0 +1,34 @@
+name: Fotos desde TCG Factory
+
+on:
+  workflow_dispatch:
+    inputs:
+      subir:
+        description: "¿Subir las imágenes? (false = solo prueba)"
+        required: true
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
+
+jobs:
+  fotos:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - run: pip install requests
+
+      - name: Buscar y subir imágenes
+        env:
+          SHOPIFY_TOKEN: ${{ secrets.SHOPIFY_TOKEN }}
+          SHOPIFY_STORE: ${{ secrets.SHOPIFY_STORE }}
+          DRY_RUN: ${{ github.event.inputs.subir == 'true' && 'false' || 'true' }}
+          MAX_LOOKUPS: "40"
+        run: python fotos_tcgfactory.py
