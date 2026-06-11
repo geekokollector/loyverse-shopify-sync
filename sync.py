@@ -25,6 +25,11 @@ LOYVERSE_TOKEN = os.environ["LOYVERSE_TOKEN"]
 SHOPIFY_TOKEN = os.environ["SHOPIFY_TOKEN"]
 SHOPIFY_STORE = os.environ["SHOPIFY_STORE"]  # ej: geekollector.myshopify.com
 LOYVERSE_STORE_ID = os.environ.get("LOYVERSE_STORE_ID", "")
+LOYVERSE_CATEGORIES = [
+    c.strip().lower()
+    for c in os.environ.get("LOYVERSE_CATEGORIES", "").split(",")
+    if c.strip()
+]
 SAFETY_BUFFER = int(os.environ.get("SAFETY_BUFFER", "0"))
 CREATE_DRAFTS = os.environ.get("CREATE_DRAFTS", "true").lower() == "true"
 
@@ -108,8 +113,35 @@ def set_inventory(location_id, inventory_item_id, qty, label=""):
 # 1. LOYVERSE: artículos + stock
 # ---------------------------------------------------------------------------
 
+def get_loyverse_category_ids():
+    """Devuelve los IDs de las categorías cuyo nombre está en LOYVERSE_CATEGORIES."""
+    if not LOYVERSE_CATEGORIES:
+        return None
+    ids = set()
+    cursor = None
+    while True:
+        params = {"limit": 250}
+        if cursor:
+            params["cursor"] = cursor
+        data = lv_get("/categories", params)
+        for c in data.get("categories", []):
+            if c.get("name", "").strip().lower() in LOYVERSE_CATEGORIES:
+                ids.add(c["id"])
+        cursor = data.get("cursor")
+        if not cursor:
+            break
+    if not ids:
+        raise RuntimeError(
+            f"No se encontró ninguna categoría llamada {LOYVERSE_CATEGORIES} en Loyverse"
+        )
+    return ids
+
+
 def get_loyverse_items():
-    """Devuelve lista de variantes: {variant_id, item_name, barcode, sku, price, category}"""
+    """Devuelve lista de variantes filtradas por categoría (si LOYVERSE_CATEGORIES
+    está definido) y por disponibilidad en la tienda (si LOYVERSE_STORE_ID está
+    definido)."""
+    category_ids = get_loyverse_category_ids()
     items = []
     cursor = None
     while True:
@@ -118,7 +150,17 @@ def get_loyverse_items():
             params["cursor"] = cursor
         data = lv_get("/items", params)
         for item in data.get("items", []):
+            if category_ids is not None and item.get("category_id") not in category_ids:
+                continue  # no es de las categorías Geeko → se ignora
             for v in item.get("variants", []):
+                if LOYVERSE_STORE_ID:
+                    store_cfg = next(
+                        (s for s in v.get("stores", [])
+                         if s.get("store_id") == LOYVERSE_STORE_ID),
+                        None,
+                    )
+                    if not store_cfg or not store_cfg.get("available_for_sale", False):
+                        continue  # no está activo en la tienda Geeko → se ignora
                 items.append({
                     "variant_id": v["variant_id"],
                     "item_name": item.get("item_name", ""),
